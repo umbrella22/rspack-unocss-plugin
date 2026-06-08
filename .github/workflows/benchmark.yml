@@ -9,7 +9,7 @@ on:
       file-count:
         description: Vue files generated in CI
         required: false
-        default: "10000"
+        default: "20000"
       runs:
         description: Build runs per plugin
         required: false

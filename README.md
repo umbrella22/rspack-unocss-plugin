@@ -26,6 +26,48 @@ This plugin takes a Rspack-native approach instead:
 
 The result is not intended to replace UnoCSS itself. UnoCSS still owns scanning, presets, rules, variants, shortcuts, transformers, layers, and CSS generation. Rspack owns bundling, native CSS parsing, CSS assets, and optional Lightning CSS minimization.
 
+## Benchmarking
+
+This repository includes a benchmark workspace that compares this plugin with the official `@unocss/webpack/rspack` integration.
+
+### Rspack UnoCSS Plugin Benchmark
+
+> The benchmark table below was measured locally on macOS with an Apple M2 and 16 GB memory. GitHub Actions run URLs such as `https://github.com/umbrella22/rspack-unocss-plugin/actions/runs/27128910390` point to one immutable workflow run; the trailing number is GitHub's generated run id and cannot be changed to mean "latest". To view the latest benchmark result, open the [Benchmark workflow runs](https://github.com/umbrella22/rspack-unocss-plugin/actions/workflows/benchmark.yml?query=branch%3Amain) and select the newest successful run.
+
+- Vue files: 20000
+- Runs: 3
+
+| plugin                 |     avg |  median |     min |     max |
+| ---------------------- | ------: | ------: | ------: | ------: |
+| rspack-unocss-plugin   | 25.016s | 24.164s | 23.989s | 26.893s |
+| @unocss/webpack/rspack | 31.771s | 33.681s | 27.851s | 33.782s |
+
+Average delta: -21.26% versus @unocss/webpack/rspack
+
+Median delta: -28.26% versus @unocss/webpack/rspack
+
+```bash
+pnpm benchmark:ci
+```
+
+Default benchmark settings:
+
+- Generates 10,000 Vue files at runtime.
+- Builds the local plugin project and official plugin project.
+- Runs each build 3 times by default.
+- Reports average, median, minimum, and maximum build time.
+- Writes `Benchmark/results/benchmark-summary.md` and `Benchmark/results/benchmark-results.json`.
+
+Use smaller values for local smoke tests:
+
+```bash
+BENCHMARK_VUE_COUNT=100 BENCHMARK_RUNS=1 pnpm benchmark:ci
+```
+
+GitHub Actions support is provided in [`.github/workflows/benchmark.yml`](./.github/workflows/benchmark.yml). The workflow generates fixtures in CI instead of committing large generated files to the repository.
+
+Benchmark results should be interpreted as end-to-end Rspack build numbers. Vue loader, Rspack module graph creation, filesystem I/O, JavaScript minification, CSS processing, and UnoCSS generation all contribute to the total time. Small percentage differences are expected because the UnoCSS integration is only one part of the full build pipeline.
+
 ## Core Value
 
 - **Native Rspack semantics**: Uses `rspack.experiments.VirtualModulesPlugin`, `rspack.NormalModuleReplacementPlugin`, and Rspack plugin hooks instead of relying on webpack-specific module-resource behavior.
@@ -414,45 +456,6 @@ export default defineConfig({
   },
 });
 ```
-
-## Benchmarking
-
-This repository includes a benchmark workspace that compares this plugin with the official `@unocss/webpack/rspack` integration.
-
-### Rspack UnoCSS Plugin Benchmark
-
-- Vue files: 20000
-- Runs: 3
-
-| plugin                 |     avg |  median |     min |     max |
-| ---------------------- | ------: | ------: | ------: | ------: |
-| rspack-unocss-plugin   | 25.016s | 24.164s | 23.989s | 26.893s |
-| @unocss/webpack/rspack | 31.771s | 33.681s | 27.851s | 33.782s |
-
-Average delta: -21.26% versus @unocss/webpack/rspack
-Median delta: -28.26% versus @unocss/webpack/rspack
-
-```bash
-pnpm benchmark:ci
-```
-
-Default benchmark settings:
-
-- Generates 10,000 Vue files at runtime.
-- Builds the local plugin project and official plugin project.
-- Runs each build 3 times by default.
-- Reports average, median, minimum, and maximum build time.
-- Writes `Benchmark/results/benchmark-summary.md` and `Benchmark/results/benchmark-results.json`.
-
-Use smaller values for local smoke tests:
-
-```bash
-BENCHMARK_VUE_COUNT=100 BENCHMARK_RUNS=1 pnpm benchmark:ci
-```
-
-GitHub Actions support is provided in [`.github/workflows/benchmark.yml`](./.github/workflows/benchmark.yml). The workflow generates fixtures in CI instead of committing large generated files to the repository.
-
-Benchmark results should be interpreted as end-to-end Rspack build numbers. Vue loader, Rspack module graph creation, filesystem I/O, JavaScript minification, CSS processing, and UnoCSS generation all contribute to the total time. Small percentage differences are expected because the UnoCSS integration is only one part of the full build pipeline.
 
 ## Development
 
