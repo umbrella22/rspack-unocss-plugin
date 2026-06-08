@@ -1,0 +1,25 @@
+{
+    "name": "rspack-vue-loader-example",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "dev": "rspack dev",
+        "build": "rspack build",
+        "preview": "rspack preview"
+    },
+    "dependencies": {
+        "rspack-unocss-plugin": "workspace:*",
+        "vue": "catalog:"
+    },
+    "devDependencies": {
+        "@rspack/cli": "catalog:",
+        "@rspack/core": "catalog:",
+        "@rspack/dev-server": "catalog:",
+        "rspack-vue-loader": "catalog:",
+        "@unocss/preset-wind4": "catalog:",
+        "@vicons/material": "catalog:",
+        "unocss": "catalog:",
+        "@types/node": "catalog:",
+        "typescript": "catalog:"
+    }
+}

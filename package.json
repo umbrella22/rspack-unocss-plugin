@@ -1,0 +1,25 @@
+{
+  "name": "rspack-unocss-plugin-workspace",
+  "private": true,
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "pnpm --filter rspack-unocss-plugin build",
+    "test": "pnpm --filter rspack-unocss-plugin test",
+    "example:build": "pnpm --filter rspack-vize-plugin-example build",
+    "example:dev": "pnpm --filter rspack-vize-plugin-example dev",
+    "benchmark:generate": "pnpm --filter benchmark-local-plugin generate && pnpm --filter benchmark-official-plugin generate",
+    "benchmark:build:local": "pnpm --filter benchmark-local-plugin build",
+    "benchmark:build:official": "pnpm --filter benchmark-official-plugin build",
+    "benchmark:build": "pnpm benchmark:build:local && pnpm benchmark:build:official",
+    "benchmark:ci": "node Benchmark/scripts/run-build-benchmark.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  },
+  "packageManager": "pnpm@10.12.4"
+}

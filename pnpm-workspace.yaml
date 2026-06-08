@@ -1,0 +1,29 @@
+packages:
+  - packages/*
+  - example
+  - example/vue-loader
+  - example/vize-plugin
+  - Benchmark/*
+
+catalog:
+  # Rspack
+  "@rspack/cli": ^2.0.6
+  "@rspack/core": ^2.0.6
+  "@rspack/dev-server": ^2.0.3
+
+  # UnoCSS
+  unocss: 66.7.0
+  "@unocss/preset-wind4": 66.7.0
+
+  # Vue
+  vue: ^3.5.34
+  rspack-vue-loader: ^17.5.1
+
+  # Build & Type
+  typescript: ^6.0.3
+  "@types/node": ^24.10.1
+  tsdown: ^0.22.2
+  vitest: ^4.1.8
+
+  # Misc
+  "@vicons/material": ^0.13.0

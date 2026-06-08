@@ -1,0 +1,7 @@
+node_modules
+Benchmark/*/src/generated
+Benchmark/*/src/generated.ts
+Benchmark/results
+Benchmark/*/dist
+example/*/dist
+packages/*/dist

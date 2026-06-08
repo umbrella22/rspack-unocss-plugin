@@ -1,0 +1,74 @@
+{
+  "name": "rspack-unocss-plugin",
+  "version": "0.1.0",
+  "description": "A native Rspack integration for UnoCSS that generates virtual UnoCSS styles and feeds them into Rspack's native CSS pipeline.",
+  "homepage": "https://github.com/umbrella22/rspack-unocss-plugin",
+  "keywords": [
+    "fast",
+    "unocss",
+    "native",
+    "plugin",
+    "rspack",
+    "sfc",
+    "vue"
+  ],
+  "bugs": {
+    "url": "https://github.com/umbrella22/rspack-unocss-plugin/issues"
+  },
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/umbrella22/rspack-unocss-plugin.git",
+    "directory": "packages/rspack-unocss-plugin"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs",
+      "default": "./dist/index.mjs"
+    },
+    "./loader": {
+      "types": "./dist/loader.d.mts",
+      "import": "./dist/loader.mjs",
+      "default": "./dist/loader.mjs"
+    }
+  },
+  "main": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "test": "vitest run",
+    "prepublishOnly": "pnpm build"
+  },
+  "dependencies": {
+    "@jridgewell/remapping": "^2.3.5",
+    "@unocss/config": "^66.7.0",
+    "fast-glob": "^3.3.3",
+    "magic-string": "^0.30.21",
+    "picomatch": "^4.0.2",
+    "unocss": "catalog:"
+  },
+  "peerDependencies": {
+    "@rspack/core": ">=1.5.0"
+  },
+  "devDependencies": {
+    "@rspack/core": "catalog:",
+    "@types/node": "catalog:",
+    "@types/picomatch": "^4.0.0",
+    "tsdown": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}
