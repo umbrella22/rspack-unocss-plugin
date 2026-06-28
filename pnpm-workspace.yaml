@@ -7,9 +7,9 @@ packages:
 
 catalog:
   # Rspack
-  "@rspack/cli": ^2.0.6
-  "@rspack/core": ^2.0.6
-  "@rspack/dev-server": ^2.0.3
+  "@rspack/cli": ^2.1.1
+  "@rspack/core": ^2.1.1
+  "@rspack/dev-server": ^2.1.0
 
   # UnoCSS
   unocss: 66.7.0
