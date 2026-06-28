@@ -126,7 +126,33 @@ export class UnoCSSRspackNativePlugin implements RspackPluginInstance {
     compiler.hooks.thisCompilation.tap(this.name, (compilation) => {
       if (options.watch) {
         compilation.hooks.finishModules.tapPromise(this.name, async () => {
-          await context.ready;
+          // Register config files as watch dependencies even when the config
+          // is broken.  `resolveConfigFiles` populates `context.configFiles`
+          // before `createUnoGenerator` (which may throw), so the paths are
+          // available regardless of `ready` resolution.  If we skip this step
+          // on failure, the watcher never learns about the config files and
+          // cannot trigger a rebuild when the user fixes the config — they
+          // would be forced to manually restart the dev server.
+          for (const file of context.configFiles)
+            compilation.fileDependencies.add(file);
+
+          try {
+            await context.ready;
+          } catch (error) {
+            // A broken config makes `ready` reject. Module eviction is
+            // non-critical when the generator cannot be created — skip it so
+            // the build can still complete (without UnoCSS) and the user sees
+            // other errors.  Config files were already registered above, so
+            // the watcher will retry once the user fixes the config.
+            compiler
+              .getInfrastructureLogger(this.name)
+              .warn(
+                `Skipping UnoCSS module eviction: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              );
+            return;
+          }
           // Evict modules that have left the graph without being deleted on
           // disk (e.g. an import was removed while the file still exists).
           // `watchRun`'s `removedFiles` only covers on-disk deletion, so without
@@ -144,8 +170,6 @@ export class UnoCSSRspackNativePlugin implements RspackPluginInstance {
             }
           }
           context.evictModulesNotIn(currentModules);
-          for (const file of context.configFiles)
-            compilation.fileDependencies.add(file);
         });
       }
 
@@ -155,12 +179,30 @@ export class UnoCSSRspackNativePlugin implements RspackPluginInstance {
           stage: Compilation.PROCESS_ASSETS_STAGE_OPTIMIZE,
         },
         async () => {
-          await context.ready;
+          // Resolve the config first. A broken config makes the generator
+          // unusable — there is nothing to generate, so bail early.
+          try {
+            await context.ready;
+          } catch (error) {
+            compiler
+              .getInfrastructureLogger(this.name)
+              .warn(
+                `UnoCSS config failed to load: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              );
+            return;
+          }
+
+          // External content extraction (content.inline / content.filesystem)
+          // is best-effort. If it fails — a globbed file became unreadable, an
+          // inline function threw — the atomic-commit pattern in
+          // `extractExternalContent` preserves the last-good external tokens.
+          // Continue to `generate()` with module tokens + stale external tokens
+          // so the build still produces UnoCSS for source-file classes.
           try {
             await context.extractExternalContent();
           } catch (error) {
-            // A failing `content.inline` function or unreadable `filesystem`
-            // file should degrade gracefully, not abort the whole build.
             compiler
               .getInfrastructureLogger(this.name)
               .warn(
@@ -452,11 +494,11 @@ function ruleMatchesCss(rule: unknown): boolean {
 function matchesCssTest(test: unknown): boolean {
   if (test instanceof RegExp) return matchesCssRegExp(test);
   if (typeof test === "string") {
-    // Match strings targeting the `.css` extension (e.g. ".css", "uno.css").
-    // A bare "css" substring would also match "scss"/"postcss"/"less" and
-    // falsely treat those rules as CSS handlers, skipping the fallback
-    // `css/auto` rule and potentially leaving `uno.css` without a loader.
-    return test.includes(".css");
+    // Match strings that target the `.css` extension. `.endsWith` is used
+    // instead of `.includes` so patterns like `"css.module"` or `"file.css.map"`
+    // are not mistaken for CSS rules — only strings that genuinely end with
+    // the `.css` suffix (e.g. `".css"`, `"uno.css"`, `"*.css"`) match.
+    return test.endsWith(".css");
   }
   // A function test cannot be evaluated reliably here; assume it is not a CSS
   // rule so the fallback `css/auto` rule is still injected when needed.

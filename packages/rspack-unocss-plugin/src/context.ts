@@ -135,19 +135,33 @@ export function createUnoCSSNativeContext(
   let lastGenerateResult: GeneratedCss | undefined;
 
   async function doReloadConfig() {
-    // Bump the version before swapping the generator so any `generate()` call
-    // that observes the new `uno` also sees a new cache key. Bumping at the end
-    // left a window where a new generator was already in place but the cache key
-    // still matched the old run, returning stale CSS built from the old config.
-    configVersion += 1;
     // Resolve config file paths before creating the generator. Generator
     // creation is the step most likely to throw on a broken initial config
     // (syntax error, missing preset, bad `configOrPath`). Resolving paths first
     // guarantees they are registered as watch dependencies even on failure, so
     // the user can fix the config and the watcher re-triggers a reload instead
     // of the plugin getting permanently stuck with an empty `configFiles`.
-    configFiles = await resolveConfigFiles(options);
-    uno = await createUnoGenerator(options);
+    const globConfigFiles = await resolveConfigFiles(options);
+    // Set config files from the glob immediately so they are registered as
+    // watch dependencies even if generator creation fails below (broken config,
+    // missing preset, etc.). The original design guarantees `configFiles` is
+    // populated before the potentially-throwing `createUnoGenerator` call so
+    // the watcher can retrigger a reload once the user fixes the config.
+    configFiles = globConfigFiles;
+    const { generator, sources } = await createUnoGenerator(options);
+    // Merge in config files discovered by @unocss/config's `loadConfig`, which
+    // walks up the directory tree and may find configs in a parent monorepo
+    // directory that the root-scoped glob would miss.
+    if (sources.length > 0) {
+      configFiles = new Set([...globConfigFiles, ...sources]);
+    }
+    // Bump the version AFTER swapping the generator. Bumping before risks
+    // leaving a stale cache key if generator creation throws: `configVersion`
+    // would be incremented but `uno` would still be the old generator, and the
+    // next `generate()` would compute a fresh key but with the old `uno`
+    // (wasted work) while the old cached result would never be hit again.
+    configVersion += 1;
+    uno = generator;
     // Mark external content stale before the re-transform loop: a new generator
     // changes how it is extracted, and if the loop throws partway the next pass
     // must still re-extract against the new generator rather than reusing the
@@ -164,13 +178,20 @@ export function createUnoCSSNativeContext(
     }
   }
 
+  // In-flight guard: `reloadConfig` may be called while a previous reload is
+  // still in progress (e.g. rapid saves, programmatic API).  Serialising
+  // through a single chain prevents interleaved mutations of `uno`,
+  // `configVersion`, `configFiles`, and the per-module caches.
+  let _reloadChain: Promise<void> = Promise.resolve();
+
   function reloadConfig(): Promise<void> {
     // Each reload attempt becomes the new `ready`. A failed initial load (e.g.
     // a broken config) no longer permanently rejects `ready`: once the user
     // fixes the config the watcher re-triggers `reloadConfig`, and a successful
     // run replaces `ready` with a resolved promise so downstream hooks recover
     // instead of staying rejected forever.
-    const promise = doReloadConfig();
+    const promise = _reloadChain.then(() => doReloadConfig());
+    _reloadChain = promise.catch(() => {});
     readyPromise = promise;
     return promise;
   }
@@ -413,9 +434,15 @@ export { LAYER_MARK_ALL };
 
 async function createUnoGenerator(
   options: ResolvedUnoCSSRspackNativePluginOptions,
-) {
+): Promise<{ generator: UnoGenerator; sources: string[] }> {
   if (typeof options.configOrPath === "object") {
-    return createGenerator(options.configOrPath, options.defaults);
+    // `createGenerator` returns a Promise in unocss >= 66; await it so the
+    // returned `generator` field holds the resolved UnoGenerator, not a
+    // pending Promise whose `.config` would be undefined.
+    return {
+      generator: await createGenerator(options.configOrPath, options.defaults),
+      sources: [],
+    };
   }
 
   const result = await loadConfig(
@@ -424,7 +451,14 @@ async function createUnoGenerator(
     undefined,
     options.defaults,
   );
-  return createGenerator(result.config, options.defaults);
+  // `loadConfig` walks up the directory tree and may find config files in a
+  // parent directory (common in monorepo setups). `result.sources` contains
+  // every config file that contributed, including those outside `options.root`.
+  // These must be registered as watch dependencies so edits trigger a reload.
+  return {
+    generator: await createGenerator(result.config, options.defaults),
+    sources: result.sources,
+  };
 }
 
 async function resolveConfigFiles(
@@ -466,7 +500,7 @@ export function createSourceFilter(
   const includeMatcher = createIncludeMatcher({ ...options, include });
   return (file) => {
     if (isVirtualUnoPath(file)) return false;
-    if (matchesExclude(file, exclude)) return false;
+    if (matchesExclude(file, exclude, options.root)) return false;
     if (include.length > 0) return includeMatcher(file);
     return hasDefaultExtension(file);
   };
@@ -506,10 +540,30 @@ function createIncludeMatcher(
 function matchesExclude(
   file: string,
   exclude: ResolvedUnoCSSRspackNativePluginOptions["exclude"],
+  root: string,
 ) {
-  return exclude.some((item) =>
-    typeof item === "string" ? file.includes(item) : item.test(file),
-  );
+  const relative = toPosix(path.relative(root, file));
+  for (const item of exclude) {
+    if (item instanceof RegExp) {
+      // Test against both the absolute and the relative path, consistent with
+      // `createIncludeMatcher`. A user-supplied regex like `/^src\/legacy\//`
+      // matches the relative form and would be silently ignored if only the
+      // absolute path were tested.
+      if (item.test(file) || item.test(relative)) return true;
+    } else {
+      // String exclude patterns use picomatch glob matching, consistent with
+      // `include`.  The glob is tested against both the absolute path and the
+      // path relative to `root`, so patterns like `"**/node_modules/**"` and
+      // `"/abs/path/to/file"` both work.
+      if (
+        picomatch.isMatch(file, item, { dot: true }) ||
+        picomatch.isMatch(relative, item, { dot: true })
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 function hasDefaultExtension(file: string) {

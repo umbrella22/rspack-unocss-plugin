@@ -59,8 +59,13 @@ export async function applyTransformers(
     uno,
     tokens,
     getConfig: () => uno.config,
+    // UnoCSS's `invalidate` contract asks the integration to re-extract the
+    // module after the transformer finishes.  Our single-pass pipeline always
+    // runs extraction for every module, so `invalidate` is a no-op.  Clearing
+    // `tokens` here would destroy any classes the transformer already added via
+    // `ctx.tokens.add()`, silently dropping them from the generated CSS.
     invalidate: () => {
-      tokens.clear();
+      // no-op: re-extraction is implicit in our single-pass architecture
     },
   } as unknown as UnocssPluginContext;
 
