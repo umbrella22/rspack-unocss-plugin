@@ -64,6 +64,24 @@ describe("createSourceFilter", () => {
     expect(filter(path.join(root, "src", "main.ts"))).toBe(true);
     expect(filter(path.join(root, "lib", "main.ts"))).toBe(false);
   });
+
+  it("keeps matching stateless for user /g include/exclude regexes", () => {
+    // A global (/g) regex's `.test()` advances lastIndex. The filter runs once
+    // per module, so without cloning the flag away, matching would drift and
+    // the same file would flip between included/excluded across calls.
+    const filter = createSourceFilter(
+      resolveOptions({
+        include: [/src\/.*\.vue$/g],
+        exclude: [/node_modules/g],
+      }),
+    );
+    const included = path.join(root, "src", "App.vue");
+    const excluded = path.join(root, "node_modules", "pkg", "App.vue");
+    for (let i = 0; i < 5; i += 1) {
+      expect(filter(included)).toBe(true);
+      expect(filter(excluded)).toBe(false);
+    }
+  });
 });
 
 describe("createUnoCSSNativeContext", () => {

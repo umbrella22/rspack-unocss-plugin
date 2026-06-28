@@ -32,6 +32,7 @@ import {
   isUnoCssId,
   LAYER_MARK_ALL,
   LAYER_PLACEHOLDER_RE,
+  UNO_CSS_ID_RE,
 } from "./virtual.js";
 
 export type { UnoCSSRspackNativePluginOptions } from "./types.js";
@@ -40,7 +41,6 @@ type GenerateResult = Awaited<ReturnType<UnoCSSNativeContext["generate"]>>;
 
 const loaderPath = fileURLToPath(new URL("./loader.mjs", import.meta.url));
 const initialLayers = ["preflights", "default", "shortcuts", "utilities"];
-const UNO_REQUEST_RE = /^(?:virtual:)?uno(?::.+)?\.css(?:\?.*)?$/;
 
 interface VirtualCssModule {
   path: string;
@@ -111,14 +111,40 @@ export class UnoCSSRspackNativePlugin implements RspackPluginInstance {
           break;
         }
       }
+      // Re-extract `content.filesystem` sources when one of them changes or is
+      // deleted. The one-shot guard in `extractExternalContent` would otherwise
+      // keep serving stale tokens — a deleted file's classes would linger in the
+      // generated CSS for the rest of the session.
+      for (const file of context.filesystemFiles) {
+        if (modified.has(file) || (removed?.has(file) ?? false)) {
+          context.invalidateExternalContent();
+          break;
+        }
+      }
     });
 
     compiler.hooks.thisCompilation.tap(this.name, (compilation) => {
       if (options.watch) {
         compilation.hooks.finishModules.tapPromise(this.name, async () => {
+          await context.ready;
+          // Evict modules that have left the graph without being deleted on
+          // disk (e.g. an import was removed while the file still exists).
+          // `watchRun`'s `removedFiles` only covers on-disk deletion, so without
+          // this diff the dropped module's tokens would linger in the generate()
+          // union and the per-module caches would grow without bound across a
+          // long watch session.
+          const currentModules = new Set<string>();
+          for (const module of compilation.modules) {
+            const resource = (module as { resource?: string }).resource;
+            if (
+              typeof resource === "string" &&
+              context.shouldExtract(resource)
+            ) {
+              currentModules.add(resource);
+            }
+          }
+          context.evictModulesNotIn(currentModules);
           for (const file of context.configFiles)
-            compilation.fileDependencies.add(file);
-          for (const file of context.filesystemFiles)
             compilation.fileDependencies.add(file);
         });
       }
@@ -143,13 +169,28 @@ export class UnoCSSRspackNativePlugin implements RspackPluginInstance {
                 }`,
               );
           }
+          // Register filesystem content files as watch dependencies after they
+          // are populated by `extractExternalContent`. Doing this in
+          // `finishModules` (which runs before `processAssets`) would miss them
+          // on the first build, so edits right after startup went unnoticed.
+          if (options.watch) {
+            for (const file of context.filesystemFiles)
+              compilation.fileDependencies.add(file);
+          }
           const result = await context.generate();
+          // Collect layers imported via a dedicated `uno:<layer>.css` request
+          // by scanning the module graph rather than a resolve hook:
+          // unchanged modules are cached and skip the factory on watch
+          // rebuilds, so their requests would not be observed otherwise.
+          // A virtual module only enters `compilation.modules` when something
+          // actually imports it, so this reflects the true import set.
+          const excludes = collectImportedLayers(compilation, pathLayers);
 
           for (const asset of compilation.getAssets()) {
             if (!asset.name.endsWith(".css")) continue;
             const original = asset.source.source().toString();
             if (!original.includes("#unocss-")) continue;
-            const replaced = replacePlaceholders(original, result);
+            const replaced = replacePlaceholders(original, result, excludes);
             if (replaced !== original) {
               compilation.updateAsset(
                 asset.name,
@@ -162,7 +203,7 @@ export class UnoCSSRspackNativePlugin implements RspackPluginInstance {
           // changed layer alters the chunk hash and HMR re-emits the asset.
           if (!compiler.watchMode) return;
           for (const [virtualPath, layer] of pathLayers) {
-            const css = getLayerCss(result, layer);
+            const css = getLayerCss(result, layer, excludes);
             const hash = getHash(css);
             if (lastHash.get(virtualPath) === hash) continue;
             lastHash.set(virtualPath, hash);
@@ -272,7 +313,7 @@ function replaceUnoRequests(
   virtualModules: InstanceType<typeof rspack.experiments.VirtualModulesPlugin>,
   pathLayers: Map<string, string>,
 ) {
-  new rspack.NormalModuleReplacementPlugin(UNO_REQUEST_RE, (data) => {
+  new rspack.NormalModuleReplacementPlugin(UNO_CSS_ID_RE, (data) => {
     const request = data.request;
     if (!isUnoCssId(request)) return;
 
@@ -300,9 +341,14 @@ function injectLoaderRule(
   const rules = compiler.options.module.rules;
   rules.unshift({
     enforce: "pre",
+    // `sourceFilter` is the single source of truth for which files to extract:
+    // it already honours the user's `include`/`exclude` (and excludes
+    // `node_modules` by default). A hard-coded rule-level `exclude` here would
+    // be AND-ed with `test` by Rspack and silently override a user who
+    // explicitly includes files under `node_modules`, so it is intentionally
+    // omitted.
     test: (resource: string) =>
       typeof resource === "string" && sourceFilter(resource),
-    exclude: /node_modules/,
     // Pin to the main thread: extraction relies on the in-process context
     // registry, which a worker thread cannot reach. This stays correct even if
     // Rspack ever defaults loaders to parallel — other loaders (swc, vue) can
@@ -311,17 +357,53 @@ function injectLoaderRule(
   });
 }
 
-function replacePlaceholders(source: string, result: GenerateResult): string {
+function replacePlaceholders(
+  source: string,
+  result: GenerateResult,
+  excludes?: string[],
+): string {
   return source
     .replace(HASH_PLACEHOLDER_RE, "")
     .replace(LAYER_PLACEHOLDER_RE, (_match, layer: string) =>
-      getLayerCss(result, layer.trim()),
+      getLayerCss(result, layer.trim(), excludes),
     );
 }
 
-function getLayerCss(result: GenerateResult, layer: string): string {
-  if (layer === LAYER_MARK_ALL) return result.getLayers() ?? "";
+function getLayerCss(
+  result: GenerateResult,
+  layer: string,
+  excludes?: string[],
+): string {
+  // The all-layers module expands to every layer NOT already imported through
+  // a dedicated `uno:<layer>.css` virtual module, so importing both `uno.css`
+  // and `uno:<layer>.css` does not duplicate that layer's CSS. Matches UnoCSS's
+  // official `getLayers(undefined, resolvedLayers)` semantics.
+  if (layer === LAYER_MARK_ALL)
+    return result.getLayers(undefined, excludes) ?? "";
   return result.getLayer(layer) ?? "";
+}
+
+/**
+ * Returns the layers imported through a dedicated `uno:<layer>.css` request in
+ * the current compilation, derived from the module graph. A virtual module is
+ * only present in `compilation.modules` when something imports it, so this is
+ * accurate regardless of module caching (unchanged modules skip the factory on
+ * watch rebuilds, which would hide a resolve-hook-based approach).
+ */
+function collectImportedLayers(
+  compilation: Compilation,
+  pathLayers: Map<string, string>,
+): string[] {
+  const layers = new Set<string>();
+  for (const module of compilation.modules) {
+    const resource = (module as { resource?: string }).resource;
+    if (typeof resource === "string" && pathLayers.has(resource)) {
+      const layer = pathLayers.get(resource);
+      // The all-layers `uno.css` module is not a separately-imported layer.
+      if (layer && layer !== LAYER_MARK_ALL) layers.add(layer);
+    }
+  }
+  return [...layers];
 }
 
 function getHash(input: string) {
@@ -362,20 +444,35 @@ function ruleMatchesCss(rule: unknown): boolean {
   if (Array.isArray(r.rules) && r.rules.some(ruleMatchesCss)) return true;
 
   const test = r.test;
-  if (test instanceof RegExp) return test.test("uno.css");
+  if (test instanceof RegExp) return matchesCssRegExp(test);
   if (Array.isArray(test)) return test.some((item) => matchesCssTest(item));
   return matchesCssTest(test);
 }
 
 function matchesCssTest(test: unknown): boolean {
-  if (test instanceof RegExp) return test.test("uno.css");
-  if (typeof test === "string")
-    return test.includes(".css") || test.includes("css");
+  if (test instanceof RegExp) return matchesCssRegExp(test);
+  if (typeof test === "string") {
+    // Match strings targeting the `.css` extension (e.g. ".css", "uno.css").
+    // A bare "css" substring would also match "scss"/"postcss"/"less" and
+    // falsely treat those rules as CSS handlers, skipping the fallback
+    // `css/auto` rule and potentially leaving `uno.css` without a loader.
+    return test.includes(".css");
+  }
   // A function test cannot be evaluated reliably here; assume it is not a CSS
   // rule so the fallback `css/auto` rule is still injected when needed.
   if (typeof test === "function") return false;
   if (test !== undefined) return true;
   return false;
+}
+
+/**
+ * Tests a user-supplied CSS-rule regex against `uno.css` without advancing the
+ * original's `lastIndex`. A `/g` regex's `.test()` is stateful, and Rspack
+ * reuses the same regex object for its own module matching, so leaking state
+ * here would misclassify the user's modules. Clone without the global flag.
+ */
+function matchesCssRegExp(re: RegExp): boolean {
+  return new RegExp(re.source, re.flags.replace("g", "")).test("uno.css");
 }
 
 function warnIfCssExperimentDisabled(compiler: Compiler) {

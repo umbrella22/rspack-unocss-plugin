@@ -37,7 +37,21 @@ export interface UnoCSSNativeContext {
   transformModule(code: string, id: string): Promise<TransformResult>;
   /** Drops a module's cached code and tokens (e.g. when its file is deleted). */
   removeModule(id: string): void;
+  /**
+   * Drops every cached module whose path is not in `current`. Used each watch
+   * rebuild to evict modules that left the graph without being deleted on disk
+   * (e.g. an import was removed), so their tokens stop feeding `generate()` and
+   * the per-module caches do not grow without bound.
+   */
+  evictModulesNotIn(current: Set<string>): void;
   extractExternalContent(): Promise<void>;
+  /**
+   * Marks the external (`content.inline` / `content.filesystem`) extraction as
+   * stale so the next `extractExternalContent()` re-runs from scratch. Called
+   * when a watched filesystem content file changes — the one-shot guard alone
+   * would otherwise keep serving stale tokens until a config reload.
+   */
+  invalidateExternalContent(): void;
   generate(): Promise<GeneratedCss>;
 }
 
@@ -89,6 +103,10 @@ export function createUnoCSSNativeContext(
   // actually changed are re-run by the loader, and tokens are recomputed as the
   // union of every module's set, so removed classes do not linger. `removeModule`
   // evicts both maps when a file leaves the graph so its tokens stop appearing.
+  // `moduleSources` keeps the loader-supplied (pre-transform) source so that a
+  // config reload can re-run the transformer pipeline against the original code
+  // — `moduleCode` alone only holds the post-transform output.
+  const moduleSources = new Map<string, string>();
   const moduleCode = new Map<string, string>();
   const moduleTokens = new Map<string, Set<string>>();
   // Tokens extracted from `content.inline` / `content.filesystem`. Kept separate
@@ -116,39 +134,82 @@ export function createUnoCSSNativeContext(
   let lastGenerateKey: string | undefined;
   let lastGenerateResult: GeneratedCss | undefined;
 
-  async function reloadConfig() {
-    uno = await createUnoGenerator(options);
-    configFiles = await resolveConfigFiles(options);
-    // Re-extract every cached module with the new generator so config changes
-    // do not require the whole graph to be rebuilt.
-    for (const [id, code] of moduleCode) {
-      moduleTokens.set(id, await extractTokens(uno, code, id));
-    }
-    // External content is generator-dependent too; force a refresh on next pass.
-    externalExtracted = false;
-    // A new generator can map identical tokens to different CSS, so invalidate
-    // the generate cache regardless of whether the token union changed.
+  async function doReloadConfig() {
+    // Bump the version before swapping the generator so any `generate()` call
+    // that observes the new `uno` also sees a new cache key. Bumping at the end
+    // left a window where a new generator was already in place but the cache key
+    // still matched the old run, returning stale CSS built from the old config.
     configVersion += 1;
+    // Resolve config file paths before creating the generator. Generator
+    // creation is the step most likely to throw on a broken initial config
+    // (syntax error, missing preset, bad `configOrPath`). Resolving paths first
+    // guarantees they are registered as watch dependencies even on failure, so
+    // the user can fix the config and the watcher re-triggers a reload instead
+    // of the plugin getting permanently stuck with an empty `configFiles`.
+    configFiles = await resolveConfigFiles(options);
+    uno = await createUnoGenerator(options);
+    // Mark external content stale before the re-transform loop: a new generator
+    // changes how it is extracted, and if the loop throws partway the next pass
+    // must still re-extract against the new generator rather than reusing the
+    // previous one's external tokens.
+    externalExtracted = false;
+    // Re-run the full transformer pipeline against each module's original source
+    // so transformer/rule changes take effect without a full graph rebuild.
+    // `moduleCode` only holds post-transform output, which is not re-transformable,
+    // so this relies on `moduleSources`. `transformModuleInner` is used instead of
+    // `transformModule` because the latter `await`s `ready` — the very promise this
+    // reload fulfils — which would otherwise deadlock.
+    for (const id of [...moduleSources.keys()]) {
+      await transformModuleInner(moduleSources.get(id)!, id);
+    }
+  }
+
+  function reloadConfig(): Promise<void> {
+    // Each reload attempt becomes the new `ready`. A failed initial load (e.g.
+    // a broken config) no longer permanently rejects `ready`: once the user
+    // fixes the config the watcher re-triggers `reloadConfig`, and a successful
+    // run replaces `ready` with a resolved promise so downstream hooks recover
+    // instead of staying rejected forever.
+    const promise = doReloadConfig();
+    readyPromise = promise;
+    return promise;
   }
 
   async function transformModule(
     code: string,
     id: string,
   ): Promise<TransformResult> {
-    await ready;
+    await readyPromise;
+    return transformModuleInner(code, id);
+  }
+
+  /**
+   * Transform + extract core, assuming `uno` and the config are already loaded.
+   * Split out so `reloadConfig` can re-run the pipeline against cached sources
+   * without `await`ing `ready` (which is the promise `reloadConfig` itself
+   * resolves, so awaiting it here would deadlock).
+   */
+  async function transformModuleInner(
+    code: string,
+    id: string,
+  ): Promise<TransformResult> {
     const t0 = profile.enabled ? performance.now() : 0;
-    const result = await applyTransformers(code, id, {
-      uno,
-      tokens: moduleTokens.get(id) ?? new Set<string>(),
-    });
+    // Fresh token set per transform, shared between the transformer context and
+    // the extractor. Transformers may `add` classes they infer without writing
+    // them into the code (the UnoCSS `context.tokens` contract); extracting into
+    // the same set merges those with classes found in the transformed code.
+    // Reusing the previous module's set would let dropped classes linger.
+    const tokens = new Set<string>();
+    const result = await applyTransformers(code, id, { uno, tokens });
     if (profile.enabled) {
       profile.transformMs += performance.now() - t0;
       profile.transformCount += 1;
     }
+    moduleSources.set(id, code);
     moduleCode.set(id, result.code);
 
     const e0 = profile.enabled ? performance.now() : 0;
-    moduleTokens.set(id, await extractTokens(uno, result.code, id));
+    moduleTokens.set(id, await extractTokens(uno, result.code, id, tokens));
     if (profile.enabled) {
       profile.extractMs += performance.now() - e0;
       profile.extractCount += 1;
@@ -157,56 +218,109 @@ export function createUnoCSSNativeContext(
   }
 
   function removeModule(id: string) {
+    moduleSources.delete(id);
     moduleCode.delete(id);
     moduleTokens.delete(id);
   }
 
-  async function extractExternalContent() {
-    await ready;
-    // `content.inline` / `content.filesystem` do not change between watch
-    // rebuilds, so extract them once. `reloadConfig` resets the flag because a
-    // new generator (and possibly new content config) requires a fresh pass.
-    if (externalExtracted) return;
-    externalExtracted = true;
-
-    const inline = uno.config.content?.inline ?? [];
-    for (let index = 0; index < inline.length; index += 1) {
-      const entry = inline[index];
-      const resolved = typeof entry === "function" ? await entry() : entry;
-      const code = typeof resolved === "string" ? resolved : resolved.code;
-      const id =
-        typeof resolved === "string"
-          ? `__inline_${index}__`
-          : (resolved.id ?? `__inline_${index}__`);
-      const transformed = await applyTransformers(code, id, {
-        uno,
-        tokens: new Set<string>(),
-      });
-      externalTokens.set(id, await extractTokens(uno, transformed.code, id));
-    }
-
-    const patterns = uno.config.content?.filesystem ?? [];
-    if (patterns.length === 0) return;
-
-    const files = await fg(patterns, {
-      cwd: options.root,
-      absolute: true,
-      onlyFiles: true,
-      ignore: ["**/node_modules/**", "**/.git/**"],
-    });
-    for (const file of files) {
-      filesystemFiles.add(file);
-      const code = await fs.readFile(file, "utf8");
-      const transformed = await applyTransformers(code, file, {
-        uno,
-        tokens: new Set<string>(),
-      });
-      externalTokens.set(file, await extractTokens(uno, transformed.code, file));
+  /**
+   * Drops every cached module that is no longer in the current module graph.
+   * `removeModule` only handles files reported as removed from disk, but a
+   * module can leave the graph while its file still exists (an import was
+   * removed, a route deleted, a component retired). Without this diff those
+   * modules' tokens would linger in the generate() union and the per-module
+   * caches would grow without bound across a long watch session.
+   */
+  function evictModulesNotIn(current: Set<string>) {
+    for (const id of [...moduleCode.keys()]) {
+      if (!current.has(id)) {
+        moduleSources.delete(id);
+        moduleCode.delete(id);
+        moduleTokens.delete(id);
+      }
     }
   }
 
+  async function extractExternalContent() {
+    await readyPromise;
+    // `content.inline` / `content.filesystem` are re-extracted only when stale:
+    // initially, after `reloadConfig`, or after `invalidateExternalContent`
+    // (a watched filesystem content file changed).
+    if (externalExtracted) return;
+    externalExtracted = true;
+
+    // Extract into pending collections first, then commit atomically. If any
+    // entry throws (a failing `content.inline` function, or a filesystem file
+    // deleted between glob and read in watch mode), the previously-good tokens
+    // and watch dependencies stay in place — so the generated CSS degrades to
+    // the last known-good state instead of being wiped, and filesystem content
+    // files keep being watched. The guard is reset so the next compilation
+    // retries from scratch.
+    const pendingTokens = new Map<string, Set<string>>();
+    const pendingFiles = new Set<string>();
+    try {
+      const inline = uno.config.content?.inline ?? [];
+      for (let index = 0; index < inline.length; index += 1) {
+        const entry = inline[index];
+        const resolved = typeof entry === "function" ? await entry() : entry;
+        const code = typeof resolved === "string" ? resolved : resolved.code;
+        const id =
+          typeof resolved === "string"
+            ? `__inline_${index}__`
+            : (resolved.id ?? `__inline_${index}__`);
+        const extTokens = new Set<string>();
+        const transformed = await applyTransformers(code, id, {
+          uno,
+          tokens: extTokens,
+        });
+        pendingTokens.set(
+          id,
+          await extractTokens(uno, transformed.code, id, extTokens),
+        );
+      }
+
+      const patterns = uno.config.content?.filesystem ?? [];
+      if (patterns.length > 0) {
+        const files = await fg(patterns, {
+          cwd: options.root,
+          absolute: true,
+          onlyFiles: true,
+          ignore: ["**/node_modules/**", "**/.git/**"],
+        });
+        for (const file of files) {
+          pendingFiles.add(file);
+          const code = await fs.readFile(file, "utf8");
+          const extTokens = new Set<string>();
+          const transformed = await applyTransformers(code, file, {
+            uno,
+            tokens: extTokens,
+          });
+          pendingTokens.set(
+            file,
+            await extractTokens(uno, transformed.code, file, extTokens),
+          );
+        }
+      }
+    } catch (error) {
+      externalExtracted = false;
+      throw error;
+    }
+
+    // Commit only after a fully successful pass. This rebuilds both
+    // collections from scratch (a shrunken glob/inline list drops entries that
+    // are no longer present) without ever exposing an empty intermediate state.
+    externalTokens.clear();
+    for (const [id, tokens] of pendingTokens) externalTokens.set(id, tokens);
+    filesystemFiles.clear();
+    for (const file of pendingFiles) filesystemFiles.add(file);
+  }
+
+  function invalidateExternalContent() {
+    externalExtracted = false;
+  }
+
   async function generate() {
-    await ready;
+    await readyPromise;
     const tokens = new Set<string>();
     for (const set of moduleTokens.values()) {
       for (const token of set) tokens.add(token);
@@ -235,13 +349,19 @@ export function createUnoCSSNativeContext(
     return result;
   }
 
-  const ready = reloadConfig();
+  // Declared separately from its first assignment so `reloadConfig` (which
+  // reassigns it on every call) can write the field without hitting the temporal
+  // dead zone of a single `let x = reloadConfig()` initializer.
+  let readyPromise: Promise<void>;
+  readyPromise = reloadConfig();
 
   return {
     get uno() {
       return uno;
     },
-    ready,
+    get ready() {
+      return readyPromise;
+    },
     get configFiles() {
       return configFiles;
     },
@@ -254,25 +374,39 @@ export function createUnoCSSNativeContext(
     shouldExtract: sourceFilter,
     transformModule,
     removeModule,
+    evictModulesNotIn,
     extractExternalContent,
+    invalidateExternalContent,
     generate,
   };
 }
 
-async function extractTokens(uno: UnoGenerator, code: string, id: string) {
-  const set = new Set<string>();
-  await uno.applyExtractors(code, id, set);
-  return set;
+async function extractTokens(
+  uno: UnoGenerator,
+  code: string,
+  id: string,
+  into: Set<string> = new Set<string>(),
+) {
+  // Extract into the provided set so callers can merge transformer-added tokens
+  // (handed to the transformer context) with extractor-found tokens in one set.
+  await uno.applyExtractors(code, id, into);
+  return into;
 }
 
 /**
  * Order-independent fingerprint of a token set. Sorting makes the hash depend
  * only on which classes are present, not on module extraction order, so an
  * unrelated rebuild that produces the same classes hits the generate cache.
+ * Each token is length-prefixed so a token containing a newline (or any other
+ * delimiter) can't be confused with two adjacent tokens — e.g. without the
+ * prefix `"a\nb"` and `["a","b"]` would produce the same `join` and collide.
  */
 function hashTokens(tokens: Set<string>) {
   const sorted = Array.from(tokens).sort();
-  return createHash("sha256").update(sorted.join("\n")).digest("hex");
+  const fingerprint = sorted
+    .map((token) => `${token.length}:${token}`)
+    .join("");
+  return createHash("sha256").update(fingerprint).digest("hex");
 }
 
 export { LAYER_MARK_ALL };
@@ -323,13 +457,29 @@ async function resolveConfigFiles(
 export function createSourceFilter(
   options: ResolvedUnoCSSRspackNativePluginOptions,
 ): (file: string) => boolean {
-  const includeMatcher = createIncludeMatcher(options);
+  // `.test()` on a global (/g) regex is stateful — it advances lastIndex,
+  // and this filter runs once per module, so a user-supplied /g pattern would
+  // drift between modules and misclassify them. Clone without the global flag
+  // so matching stays stateless; the user's original regexes are untouched.
+  const include = withoutGlobalFlag(options.include);
+  const exclude = withoutGlobalFlag(options.exclude);
+  const includeMatcher = createIncludeMatcher({ ...options, include });
   return (file) => {
     if (isVirtualUnoPath(file)) return false;
-    if (matchesExclude(file, options.exclude)) return false;
-    if (options.include.length > 0) return includeMatcher(file);
+    if (matchesExclude(file, exclude)) return false;
+    if (include.length > 0) return includeMatcher(file);
     return hasDefaultExtension(file);
   };
+}
+
+function withoutGlobalFlag(
+  patterns: Array<string | RegExp>,
+): Array<string | RegExp> {
+  return patterns.map((item) =>
+    item instanceof RegExp
+      ? new RegExp(item.source, item.flags.replace("g", ""))
+      : item,
+  );
 }
 
 function createIncludeMatcher(

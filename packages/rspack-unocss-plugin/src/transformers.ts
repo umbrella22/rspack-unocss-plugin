@@ -17,6 +17,15 @@ const transformerEnforces = ["pre", "default", "post"] as const;
 const SKIP_START_RE = /@unocss-skip-start/g;
 const SKIP_END = "@unocss-skip-end";
 
+/**
+ * Prefix for the unique sentinel each masked skip region is replaced with.
+ * Mirrors UnoCSS's official `transformSkipCode`/`restoreSkipCode` strategy: a
+ * unique sentinel that no source transformer matches as a class, so `restore`
+ * can splice each original back by key (`replaceAll`) rather than by the
+ * ambiguous "first equal-length blank" the previous space-based masking used.
+ */
+const SKIP_PLACEHOLDER_PREFIX = "@unocss-skip-placeholder-";
+
 export interface TransformerContextOptions {
   uno: UnoGenerator;
   tokens: Set<string>;
@@ -86,10 +95,18 @@ export async function applyTransformers(
 
   if (working === original) return { code };
 
+  // `maps` was pushed oldest-transformation-first (in execution order), but
+  // `@jridgewell/remapping`'s array form expects the most recent
+  // transformation first — it `pop()`s the last entry as the root (original
+  // side) and wraps the rest outward. Reverse before passing so the combined
+  // source map reflects the real transform chain instead of an inverted one.
   const combined: SourceMap =
     maps.length === 1
       ? maps[0]
-      : (remapping(maps as never, () => null) as unknown as SourceMap);
+      : (remapping(
+          [...maps].reverse() as never,
+          () => null,
+        ) as unknown as SourceMap);
 
   return { code: restore(working), map: combined };
 }
@@ -110,8 +127,7 @@ function maskSkipRegions(code: string): {
   while ((match = SKIP_START_RE.exec(code))) {
     const start = match.index;
     const endIndex = code.indexOf(SKIP_END, start);
-    const end =
-      endIndex === -1 ? code.length : endIndex + SKIP_END.length;
+    const end = endIndex === -1 ? code.length : endIndex + SKIP_END.length;
     ranges.push([start, end]);
     SKIP_START_RE.lastIndex = end;
   }
@@ -120,24 +136,44 @@ function maskSkipRegions(code: string): {
     return { masked: code, restore: (transformed) => transformed };
   }
 
+  // Replace each skip region with a unique sentinel. Unlike equal-length
+  // spaces, a unique sentinel lets `restore` splice each original back by key
+  // (via replaceAll) instead of by "first equal-length blank", which was
+  // ambiguous when multiple regions shared a length, or when a transformer
+  // inserted equally-sized whitespace elsewhere in the file. The sentinel looks
+  // like a class/identifier fragment that no transformer treats as a token.
+  const replacements = new Map<string, string>();
   let masked = "";
   let cursor = 0;
-  const originals: string[] = [];
-  for (const [start, end] of ranges) {
+  ranges.forEach((range, index) => {
+    const [start, end] = range;
     masked += code.slice(cursor, start);
-    originals.push(code.slice(start, end));
-    masked += " ".repeat(end - start);
+    // Pad the sentinel to the region's length so character offsets in `masked`
+    // stay aligned with the original `code`. Source maps are generated against
+    // `masked`; keeping each sentinel the same length as the original it stands
+    // in for means `restore` (which swaps a sentinel back to its original) does
+    // not shift any downstream position, so the maps stay accurate. Regions
+    // shorter than the sentinel prefix are left as-is — `padEnd` never truncates,
+    // and real skip regions always contain the start/end comment markers.
+    const placeholder = `${SKIP_PLACEHOLDER_PREFIX}${index}__`.padEnd(
+      end - start,
+      " ",
+    );
+    replacements.set(placeholder, code.slice(start, end));
+    masked += placeholder;
     cursor = end;
-  }
+  });
   masked += code.slice(cursor);
 
-  // The masked regions are spaces no transformer touches, so they survive intact
-  // in the output; swap each back to its original text by index.
+  // Each sentinel is unique, so restoring exactly one region per entry is
+  // safe — but use `split`/`join` rather than `replaceAll`. A string
+  // replacement value is run through `GetSubstitution`, which would silently
+  // mangle any `$` sequences in the original skip-region source (e.g. `$1`,
+  // `$&`, `$'` that users legitimately keep inside fenced blocks).
   const restore = (transformed: string) => {
     let result = transformed;
-    for (const original of originals) {
-      const blank = " ".repeat(original.length);
-      result = result.replace(blank, () => original);
+    for (const [placeholder, original] of replacements) {
+      result = result.split(placeholder).join(original);
     }
     return result;
   };
