@@ -1,6 +1,6 @@
 {
   "name": "rspack-unocss-plugin",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A native Rspack integration for UnoCSS that generates virtual UnoCSS styles and feeds them into Rspack's native CSS pipeline.",
   "homepage": "https://github.com/umbrella22/rspack-unocss-plugin",
   "keywords": [
