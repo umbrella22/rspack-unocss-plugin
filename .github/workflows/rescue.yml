@@ -1,0 +1,87 @@
+name: Rescue Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Existing release tag to publish, e.g. v0.2.1."
+        required: true
+        type: string
+      publish_npm:
+        description: Publish this tag to npm.
+        required: false
+        type: boolean
+        default: true
+      attach_github_release:
+        description: Attach the build artifact to the existing GitHub Release.
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: publish-${{ inputs.tag_name }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag_name }}
+
+      - name: Validate requested tag matches checked out commit
+        shell: bash
+        run: |
+          git fetch --force --tags
+          tag_ref="refs/tags/${{ inputs.tag_name }}"
+          if ! git rev-parse --verify "${tag_ref}" >/dev/null 2>&1; then
+            echo "Tag ${tag_ref} does not exist." >&2
+            exit 1
+          fi
+
+          head_commit="$(git rev-parse HEAD)"
+          tag_commit="$(git rev-list -n 1 "${tag_ref}")"
+
+          if [ "${head_commit}" != "${tag_commit}" ]; then
+            echo "Checked out commit ${head_commit} does not match tag ${tag_ref} (${tag_commit})." >&2
+            exit 1
+          fi
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.12.4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Publish to npm
+        if: inputs.publish_npm == true
+        run: pnpm --filter rspack-unocss-plugin publish --no-git-checks --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Attach build artifact to GitHub Release
+        if: inputs.attach_github_release == true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            packages/rspack-unocss-plugin/dist/index.mjs
+            packages/rspack-unocss-plugin/dist/loader.mjs
+          fail_on_unmatched_files: false
